@@ -1,0 +1,17 @@
+.vscode/
+.Xil/
+.cache/
+*.cache/
+*.hw/
+*.sim/
+*.runs/
+*.ip_user_files/
+.ip_user_files/
+*.gen/
+*.jou
+*.log
+*.str
+*.wdb
+*.wcfg
+*.pb
+*.ltx
