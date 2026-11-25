@@ -1,0 +1,379 @@
+// =============================================================================
+// Boot ROM Controller
+// =============================================================================
+// AXI4-Lite slave interface to a 64KB read-only boot ROM.
+//
+// Features:
+//   - AXI4-Lite slave interface (no burst support)
+//   - 64KB ROM (16K x 32-bit words)
+//   - ROM content initialized from parameter or initial block
+//   - Single-cycle read latency (registered output)
+//   - Write attempts return SLVERR
+//   - Address range checking
+//   - Default boot code: set up stack pointer, jump to SRAM
+// =============================================================================
+
+module boot_rom
+  import riscv_pkg::*;
+  import axi_pkg::*;
+#(
+  parameter int          ADDR_WIDTH    = AXI_ADDR_WIDTH,
+  parameter int          DATA_WIDTH    = AXI_DATA_WIDTH,
+  parameter int          ROM_DEPTH     = 16384,         // 16K words = 64KB
+  parameter int          ROM_ADDR_W    = $clog2(ROM_DEPTH),
+  parameter logic [31:0] BASE_ADDR     = BOOT_ROM_BASE,
+  parameter string       ROM_INIT_FILE = ""              // Optional hex file
+) (
+  input  logic                    clk,
+  input  logic                    rst_n,
+
+  // =========================================================================
+  // AXI4-Lite Slave Interface
+  // =========================================================================
+
+  // AW channel
+  input  logic [ADDR_WIDTH-1:0]   s_axil_awaddr,
+  input  logic [2:0]              s_axil_awprot,
+  input  logic                    s_axil_awvalid,
+  output logic                    s_axil_awready,
+
+  // W channel
+  input  logic [DATA_WIDTH-1:0]   s_axil_wdata,
+  input  logic [DATA_WIDTH/8-1:0] s_axil_wstrb,
+  input  logic                    s_axil_wvalid,
+  output logic                    s_axil_wready,
+
+  // B channel
+  output logic [1:0]              s_axil_bresp,
+  output logic                    s_axil_bvalid,
+  input  logic                    s_axil_bready,
+
+  // AR channel
+  input  logic [ADDR_WIDTH-1:0]   s_axil_araddr,
+  input  logic [2:0]              s_axil_arprot,
+  input  logic                    s_axil_arvalid,
+  output logic                    s_axil_arready,
+
+  // R channel
+  output logic [DATA_WIDTH-1:0]   s_axil_rdata,
+  output logic [1:0]              s_axil_rresp,
+  output logic                    s_axil_rvalid,
+  input  logic                    s_axil_rready
+);
+
+  // ===========================================================================
+  // ROM Storage
+  // ===========================================================================
+  logic [DATA_WIDTH-1:0] rom_mem [ROM_DEPTH];
+
+  // ===========================================================================
+  // ROM Initialization
+  // ===========================================================================
+  initial begin
+    // Clear ROM first
+    for (int i = 0; i < ROM_DEPTH; i++) begin
+      rom_mem[i] = 32'h0000_0013;  // NOP (ADDI x0, x0, 0)
+    end
+
+    if (ROM_INIT_FILE != "") begin
+      $readmemh(ROM_INIT_FILE, rom_mem);
+    end else begin
+      // Default boot code: minimal initialization, then jump to SRAM
+      //
+      // Address 0x0000: lui   sp, 0x00020      # sp = SRAM_BASE + SRAM_SIZE (top of SRAM)
+      // Address 0x0004: addi  sp, sp, 0         # sp = 0x00020000
+      // Address 0x0008: lui   gp, 0x00010       # gp = SRAM_BASE
+      // Address 0x000C: lui   t0, 0x00010       # t0 = jump target (SRAM_BASE)
+      // Address 0x0010: jalr  x0, t0, 0         # jump to SRAM_BASE
+      // Address 0x0014: NOP padding...
+
+      // lui sp, 0x20  => sp = 0x00020000
+      rom_mem[0] = 32'h00020137;  // lui sp, 0x20
+      // addi sp, sp, 0
+      rom_mem[1] = 32'h00010113;  // addi sp, sp, 0 (adjust if needed)
+      // lui gp, 0x10  => gp = 0x00010000 (SRAM base)
+      rom_mem[2] = 32'h000101B7;  // lui gp, 0x10
+      // lui t0, 0x10  => t0 = 0x00010000
+      rom_mem[3] = 32'h000102B7;  // lui t0, 0x10
+      // jalr x0, t0, 0  => jump to SRAM_BASE
+      rom_mem[4] = 32'h00028067;  // jalr x0, t0, 0
+
+      // Simple trap handler at offset 0x100 (mtvec could point here)
+      // Just loop forever
+      rom_mem[64] = 32'h0000006F;  // jal x0, 0 (infinite loop)
+
+      // Machine trap vector entry point at well-known offset
+      rom_mem[128] = 32'h34102573; // csrr a0, mcause
+      rom_mem[129] = 32'h34302673; // csrr a2, mtval
+      rom_mem[130] = 32'h0000006F; // jal x0, 0 (infinite loop for debug)
+    end
+  end
+
+  // ===========================================================================
+  // Address Translation
+  // ===========================================================================
+  logic [ROM_ADDR_W-1:0] rd_word_addr;
+  logic                  addr_in_range;
+  logic [ADDR_WIDTH-1:0] local_addr;
+
+  assign local_addr    = s_axil_araddr - BASE_ADDR;
+  assign rd_word_addr  = local_addr[ROM_ADDR_W+1:2]; // Word-aligned index
+  assign addr_in_range = (local_addr < (ROM_DEPTH * 4));
+
+  // ===========================================================================
+  // Write Channel Handling - Always Return SLVERR (ROM is read-only)
+  // ===========================================================================
+  typedef enum logic [1:0] {
+    WR_IDLE    = 2'b00,
+    WR_DATA    = 2'b01,
+    WR_RESP    = 2'b10
+  } wr_state_e;
+
+  wr_state_e wr_state_q, wr_state_d;
+  logic      aw_latched_q;
+  logic      w_latched_q;
+
+  always_comb begin
+    wr_state_d      = wr_state_q;
+    s_axil_awready  = 1'b0;
+    s_axil_wready   = 1'b0;
+    s_axil_bvalid   = 1'b0;
+    s_axil_bresp    = AXI_RESP_SLVERR;  // ROM: always error on write
+
+    case (wr_state_q)
+      WR_IDLE: begin
+        s_axil_awready = 1'b1;
+        s_axil_wready  = 1'b1;
+        if (s_axil_awvalid && s_axil_wvalid) begin
+          wr_state_d = WR_RESP;
+        end else if (s_axil_awvalid) begin
+          wr_state_d = WR_DATA;
+        end
+      end
+
+      WR_DATA: begin
+        s_axil_wready = 1'b1;
+        if (s_axil_wvalid) begin
+          wr_state_d = WR_RESP;
+        end
+      end
+
+      WR_RESP: begin
+        s_axil_bvalid = 1'b1;
+        s_axil_bresp  = AXI_RESP_SLVERR;
+        if (s_axil_bready) begin
+          wr_state_d = WR_IDLE;
+        end
+      end
+
+      default: wr_state_d = WR_IDLE;
+    endcase
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      wr_state_q <= WR_IDLE;
+    end else begin
+      wr_state_q <= wr_state_d;
+    end
+  end
+
+  // ===========================================================================
+  // Read Channel Handling
+  // ===========================================================================
+  typedef enum logic [1:0] {
+    RD_IDLE  = 2'b00,
+    RD_READ  = 2'b01,
+    RD_RESP  = 2'b10
+  } rd_state_e;
+
+  rd_state_e rd_state_q, rd_state_d;
+
+  logic [DATA_WIDTH-1:0]  rd_data_q;
+  logic [1:0]             rd_resp_q;
+  logic [ADDR_WIDTH-1:0]  rd_addr_q;
+
+  always_comb begin
+    rd_state_d     = rd_state_q;
+    s_axil_arready = 1'b0;
+    s_axil_rvalid  = 1'b0;
+    s_axil_rdata   = rd_data_q;
+    s_axil_rresp   = rd_resp_q;
+
+    case (rd_state_q)
+      RD_IDLE: begin
+        s_axil_arready = 1'b1;
+        if (s_axil_arvalid) begin
+          rd_state_d = RD_READ;
+        end
+      end
+
+      RD_READ: begin
+        // Single-cycle read: data is available from ROM in this cycle
+        rd_state_d = RD_RESP;
+      end
+
+      RD_RESP: begin
+        s_axil_rvalid = 1'b1;
+        s_axil_rdata  = rd_data_q;
+        s_axil_rresp  = rd_resp_q;
+        if (s_axil_rready) begin
+          rd_state_d = RD_IDLE;
+        end
+      end
+
+      default: rd_state_d = RD_IDLE;
+    endcase
+  end
+
+  // Address latch and ROM read
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      rd_state_q <= RD_IDLE;
+      rd_data_q  <= '0;
+      rd_resp_q  <= AXI_RESP_OKAY;
+      rd_addr_q  <= '0;
+    end else begin
+      rd_state_q <= rd_state_d;
+
+      // Latch address on AR handshake
+      if (rd_state_q == RD_IDLE && s_axil_arvalid && s_axil_arready) begin
+        rd_addr_q <= s_axil_araddr;
+      end
+
+      // ROM read on RD_READ state
+      if (rd_state_q == RD_READ) begin
+        if (addr_in_range) begin
+          rd_data_q <= rom_mem[rd_word_addr];
+          rd_resp_q <= AXI_RESP_OKAY;
+        end else begin
+          rd_data_q <= 32'hDEAD_BEEF;
+          rd_resp_q <= AXI_RESP_SLVERR;
+        end
+      end
+    end
+  end
+
+  // Address recalculate using latched address for the ROM read cycle
+  logic [ROM_ADDR_W-1:0] latched_word_addr;
+  logic                  latched_in_range;
+  logic [ADDR_WIDTH-1:0] latched_local;
+
+  assign latched_local     = rd_addr_q - BASE_ADDR;
+  assign latched_word_addr = latched_local[ROM_ADDR_W+1:2];
+  assign latched_in_range  = (latched_local < (ROM_DEPTH * 4));
+
+  // Override the read using latched address
+  always_ff @(posedge clk) begin
+    if (rd_state_q == RD_READ) begin
+      if (latched_in_range) begin
+        rd_data_q <= rom_mem[latched_word_addr];
+        rd_resp_q <= AXI_RESP_OKAY;
+      end else begin
+        rd_data_q <= 32'hDEAD_BEEF;
+        rd_resp_q <= AXI_RESP_SLVERR;
+      end
+    end
+  end
+
+  // ===========================================================================
+  // Performance Monitoring
+  // ===========================================================================
+  logic [31:0] rd_access_cnt;   // Total read accesses
+  logic [31:0] rd_error_cnt;    // Reads to out-of-range addresses
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      rd_access_cnt <= '0;
+      rd_error_cnt  <= '0;
+    end else begin
+      if (s_axil_arvalid && s_axil_arready) begin
+        rd_access_cnt <= rd_access_cnt + 1;
+      end
+      if (rd_state_q == RD_RESP && s_axil_rresp == AXI_RESP_SLVERR) begin
+        rd_error_cnt <= rd_error_cnt + 1;
+      end
+    end
+  end
+
+  // ===========================================================================
+  // ROM Integrity Check
+  // ===========================================================================
+  // Compute a simple checksum over the ROM contents for integrity verification.
+  // This can be read back via a dedicated status register or debug port.
+
+  logic [31:0] rom_checksum;
+  logic        checksum_valid;
+  logic [ROM_ADDR_W-1:0] checksum_addr;
+  logic [31:0] checksum_accum;
+
+  typedef enum logic [1:0] {
+    CK_IDLE   = 2'b00,
+    CK_RUN    = 2'b01,
+    CK_DONE   = 2'b10
+  } cksum_state_e;
+
+  cksum_state_e cksum_state_q;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      cksum_state_q  <= CK_IDLE;
+      checksum_addr  <= '0;
+      checksum_accum <= '0;
+      rom_checksum   <= '0;
+      checksum_valid <= 1'b0;
+    end else begin
+      case (cksum_state_q)
+        CK_IDLE: begin
+          // Start checksum computation after reset
+          cksum_state_q  <= CK_RUN;
+          checksum_addr  <= '0;
+          checksum_accum <= '0;
+          checksum_valid <= 1'b0;
+        end
+
+        CK_RUN: begin
+          checksum_accum <= checksum_accum ^ rom_mem[checksum_addr];
+          if (checksum_addr == ROM_DEPTH - 1) begin
+            cksum_state_q <= CK_DONE;
+          end else begin
+            checksum_addr <= checksum_addr + 1;
+          end
+        end
+
+        CK_DONE: begin
+          rom_checksum   <= checksum_accum;
+          checksum_valid <= 1'b1;
+          // Stay in done state
+        end
+
+        default: cksum_state_q <= CK_IDLE;
+      endcase
+    end
+  end
+
+  // ===========================================================================
+  // Default Boot Code Details
+  // ===========================================================================
+  // The default boot code performs the following initialization sequence:
+  //
+  // 1. Set up the stack pointer (sp/x2) to top of SRAM
+  //    - lui sp, 0x20  => sp = 0x00020000
+  //
+  // 2. Set up the global pointer (gp/x3) to SRAM base
+  //    - lui gp, 0x10  => gp = 0x00010000
+  //
+  // 3. Jump to SRAM base where user code is loaded
+  //    - lui t0, 0x10  => t0 = 0x00010000
+  //    - jalr x0, t0, 0  (unconditional jump)
+  //
+  // Machine trap vector at offset 0x100:
+  //    - Simple infinite loop for unhandled traps
+  //    - Reads mcause and mtval for debug visibility
+  //
+  // The boot code assumes:
+  //    - SRAM has been initialized with application code (via JTAG or SPI flash)
+  //    - The application will set up its own trap vectors
+  //    - No interrupts are enabled during boot (MIE=0 after reset)
+
+endmodule

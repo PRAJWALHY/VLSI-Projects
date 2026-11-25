@@ -1,0 +1,18 @@
+// RISC-V Boot ROM initialization file
+// Address values are word indices (not byte addresses).
+// Unlisted locations remain initialized to NOP (32'h00000013).
+
+@0000
+00020137
+00010113
+000101B7
+000102B7
+00028067
+
+@0040
+0000006F
+
+@0080
+34102573
+34302673
+0000006F

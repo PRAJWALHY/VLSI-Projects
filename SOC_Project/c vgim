@@ -1,0 +1,243 @@
+/* =============================================================================
+ * RISC-V SoC Boot ROM Program
+ * =============================================================================
+ * Minimal boot ROM that initializes the system and jumps to SRAM.
+ * This code runs from the Boot ROM at address 0x0000_0000.
+ * ============================================================================= */
+
+#include "../lib/soc_hal.h"
+
+/* Boot ROM banner */
+static const char banner[] =
+    "\r\n"
+    "========================================\r\n"
+    "  RISC-V SoC Boot ROM v1.0\r\n"
+    "  RV32IMA, " __DATE__ " " __TIME__ "\r\n"
+    "========================================\r\n";
+
+/* =============================================================================
+ * Memory Test
+ * ============================================================================= */
+static int memtest_simple(uint32_t base, uint32_t size) {
+    volatile uint32_t *mem = (volatile uint32_t *)base;
+    uint32_t words = size / 4;
+
+    /* Write ascending pattern */
+    for (uint32_t i = 0; i < words; i++) {
+        mem[i] = i;
+    }
+
+    /* Verify */
+    for (uint32_t i = 0; i < words; i++) {
+        if (mem[i] != i) return -1;
+    }
+
+    /* Write address pattern */
+    for (uint32_t i = 0; i < words; i++) {
+        mem[i] = base + i * 4;
+    }
+
+    /* Verify */
+    for (uint32_t i = 0; i < words; i++) {
+        if (mem[i] != base + i * 4) return -1;
+    }
+
+    /* Write complement pattern */
+    for (uint32_t i = 0; i < words; i++) {
+        mem[i] = ~(base + i * 4);
+    }
+
+    /* Verify */
+    for (uint32_t i = 0; i < words; i++) {
+        if (mem[i] != ~(base + i * 4)) return -1;
+    }
+
+    return 0;
+}
+
+/* =============================================================================
+ * Boot Modes
+ * ============================================================================= */
+typedef enum {
+    BOOT_SRAM    = 0,   /* Jump directly to SRAM */
+    BOOT_SPI     = 1,   /* Load from SPI flash */
+    BOOT_UART    = 2,   /* Load from UART (XMODEM) */
+    BOOT_DDR     = 3,   /* Jump to DDR after init */
+} boot_mode_t;
+
+static boot_mode_t get_boot_mode(void) {
+    /* Read boot mode from GPIO pins or switches */
+    uint32_t gpio_val = gpio_read();
+    return (boot_mode_t)((gpio_val >> 8) & 0x3);
+}
+
+/* =============================================================================
+ * UART Boot Loader (Simple binary protocol)
+ * ============================================================================= */
+static int uart_boot_load(uint32_t dest_addr) {
+    uart_puts(UART0_BASE, "UART Boot: Send binary (4-byte length header + data)...\r\n");
+
+    /* Read 4-byte length */
+    uint32_t len = 0;
+    for (int i = 0; i < 4; i++) {
+        len |= ((uint32_t)uart_getc(UART0_BASE)) << (i * 8);
+    }
+
+    if (len == 0 || len > 0x10000) {
+        uart_puts(UART0_BASE, "Invalid length!\r\n");
+        return -1;
+    }
+
+    uart_printf(UART0_BASE, "Loading %u bytes to 0x%x...\r\n", len, dest_addr);
+
+    /* Read binary data */
+    volatile uint8_t *dest = (volatile uint8_t *)dest_addr;
+    for (uint32_t i = 0; i < len; i++) {
+        dest[i] = (uint8_t)uart_getc(UART0_BASE);
+        if ((i & 0x3FF) == 0) {
+            uart_putc(UART0_BASE, '.');
+        }
+    }
+
+    uart_puts(UART0_BASE, "\r\nDone!\r\n");
+    return 0;
+}
+
+/* =============================================================================
+ * SPI Flash Boot
+ * ============================================================================= */
+static int spi_boot_load(uint32_t flash_addr, uint32_t dest_addr, uint32_t max_size) {
+    uart_puts(UART0_BASE, "SPI Boot: Reading flash...\r\n");
+
+    spi_flash_init(SPI0_BASE);
+
+    /* Read flash JEDEC ID */
+    uint32_t flash_id = spi_flash_read_id(SPI0_BASE);
+    uart_printf(UART0_BASE, "Flash ID: 0x%x\r\n", flash_id);
+
+    if (flash_id == 0x000000 || flash_id == 0xFFFFFF) {
+        uart_puts(UART0_BASE, "No flash detected!\r\n");
+        return -1;
+    }
+
+    /* Read image header (first 8 bytes: magic + length) */
+    uint8_t header[8];
+    spi_flash_read(SPI0_BASE, flash_addr, header, 8);
+
+    uint32_t magic = (uint32_t)header[0] | ((uint32_t)header[1] << 8) |
+                     ((uint32_t)header[2] << 16) | ((uint32_t)header[3] << 24);
+    uint32_t length = (uint32_t)header[4] | ((uint32_t)header[5] << 8) |
+                      ((uint32_t)header[6] << 16) | ((uint32_t)header[7] << 24);
+
+    if (magic != 0x52495343) {  /* "RISC" */
+        uart_puts(UART0_BASE, "Invalid image header!\r\n");
+        return -1;
+    }
+
+    if (length > max_size) {
+        uart_puts(UART0_BASE, "Image too large!\r\n");
+        return -1;
+    }
+
+    uart_printf(UART0_BASE, "Loading %u bytes...\r\n", length);
+
+    /* Read image data in 256-byte chunks */
+    uint8_t *dest = (uint8_t *)dest_addr;
+    uint32_t remaining = length;
+    uint32_t offset = 8;  /* Skip header */
+
+    while (remaining > 0) {
+        uint32_t chunk = (remaining > 256) ? 256 : remaining;
+        spi_flash_read(SPI0_BASE, flash_addr + offset, dest, chunk);
+        dest += chunk;
+        offset += chunk;
+        remaining -= chunk;
+
+        if ((offset & 0xFFF) == 0) {
+            uart_putc(UART0_BASE, '.');
+        }
+    }
+
+    uart_puts(UART0_BASE, "\r\nDone!\r\n");
+    return 0;
+}
+
+/* =============================================================================
+ * Main Boot ROM Entry Point
+ * ============================================================================= */
+int main(void) {
+    /* Basic system init */
+    soc_init();
+
+    /* Print banner */
+    uart_puts(UART0_BASE, banner);
+
+    /* Print system info */
+    uint32_t hart_id;
+    __asm__ volatile("csrr %0, mhartid" : "=r"(hart_id));
+    uart_printf(UART0_BASE, "Hart ID: %d\r\n", hart_id);
+
+    uint32_t misa;
+    __asm__ volatile("csrr %0, misa" : "=r"(misa));
+    uart_printf(UART0_BASE, "MISA: 0x%x (", misa);
+    for (int i = 0; i < 26; i++) {
+        if (misa & (1 << i)) {
+            uart_putc(UART0_BASE, 'A' + i);
+        }
+    }
+    uart_puts(UART0_BASE, ")\r\n");
+
+    /* SRAM memory test */
+    uart_puts(UART0_BASE, "SRAM test... ");
+    if (memtest_simple(SRAM_BASE, 1024) == 0) {
+        uart_puts(UART0_BASE, "PASS\r\n");
+    } else {
+        uart_puts(UART0_BASE, "FAIL!\r\n");
+        while (1) __asm__ volatile("wfi");
+    }
+
+    /* Determine boot mode */
+    boot_mode_t boot_mode = get_boot_mode();
+    int boot_result = -1;
+
+    switch (boot_mode) {
+        case BOOT_SRAM:
+            uart_puts(UART0_BASE, "Boot mode: SRAM (direct jump)\r\n");
+            boot_result = 0;
+            break;
+
+        case BOOT_SPI:
+            uart_puts(UART0_BASE, "Boot mode: SPI Flash\r\n");
+            boot_result = spi_boot_load(0x000000, SRAM_BASE, 0x10000);
+            break;
+
+        case BOOT_UART:
+            uart_puts(UART0_BASE, "Boot mode: UART\r\n");
+            boot_result = uart_boot_load(SRAM_BASE);
+            break;
+
+        case BOOT_DDR:
+            uart_puts(UART0_BASE, "Boot mode: DDR (not implemented)\r\n");
+            boot_result = -1;
+            break;
+    }
+
+    if (boot_result != 0) {
+        uart_puts(UART0_BASE, "Boot failed! Entering debug mode.\r\n");
+        while (1) __asm__ volatile("wfi");
+    }
+
+    /* Jump to loaded program */
+    uint32_t entry_addr = (boot_mode == BOOT_SRAM) ? SRAM_BASE : SRAM_BASE;
+    uart_printf(UART0_BASE, "Jumping to 0x%x...\r\n\r\n", entry_addr);
+
+    /* Disable interrupts before jump */
+    __asm__ volatile("csrw mie, zero");
+
+    /* Jump to application */
+    void (*app_entry)(void) = (void (*)(void))entry_addr;
+    app_entry();
+
+    /* Should never reach here */
+    return 0;
+}
